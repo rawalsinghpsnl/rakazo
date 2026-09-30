@@ -1,16 +1,83 @@
-# Rakazo on Render — FREE tier ($0) single-service deployment.
+# Rakazo on Render — FREE tier ($0), three-service architecture.
 #
-# Why one service: Render's free plan only allows web services (no private
-# services, no background workers). So migrations + API + worker + web UI all
-# run inside a single free web service from the prebuilt public image.
-# The web UI proxies /api to the API on localhost:3100 inside the container.
+# Why three services: Render's free plan gives each web service only 512 MB
+# of RAM. A single container running API + web UI + worker runs out of memory
+# and crashes (OOM). Splitting into three free web services keeps each one
+# comfortably under the limit:
 #
-# Limits of this setup:
-# - Free web services sleep after ~15 min of inactivity (first request wakes).
-# - Free Postgres expires after 30 days (see expiresAt in dashboard).
-# - If one process (api/worker) crashes, the container keeps running.
+#   - rakazo-api:    Prisma migrations + Hono API server (healthCheckPath /health)
+#   - rakazo-web:    dependency-free Node static server for the built web UI,
+#                    proxies /api/* to rakazo-api
+#   - rakazo-worker: background worker + tiny HTTP health server on $PORT
+#                    (Render free plan has no background-worker type, so the
+#                    worker runs inside a web service that also answers health checks)
+#
+# Startup logic lives in RAKAZO_STARTUP / WORKER_STARTUP env vars and is
+# evaluated with `node -e`, so the blueprint is self-contained — no extra
+# build steps, no repo changes needed.
+#
+# Limits of the free setup:
+# - Free web services sleep after ~15 min of inactivity; the first request
+#   after sleep takes 60-90s to wake the service (not an error).
+# - Free Postgres expires after 30 days (see expiresAt in the dashboard) —
+#   upgrade or back up before then.
+# - Sandbox features (remote browser / computer / terminal execution) need
+#   E2B, Daytona or Box credentials configured in the app settings.
 
 services:
+  - type: web
+    name: rakazo-api
+    runtime: image
+    plan: free
+    region: singapore
+    image:
+      url: ghcr.io/elie222/rakazo/app:edge
+    healthCheckPath: /health
+    dockerCommand: node -e "eval(process.env.RAKAZO_STARTUP)"
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: rakazo-db
+          property: connectionString
+      - key: REDIS_URL
+        value: ""
+      - key: WEB_ORIGIN
+        fromService:
+          type: web
+          name: rakazo-web
+          property: host
+      - key: BETTER_AUTH_URL
+        fromService:
+          type: web
+          name: rakazo-web
+          property: host
+      - key: API_URL
+        fromService:
+          type: web
+          name: rakazo-api
+          property: host
+      - key: BETTER_AUTH_SECRET
+        generateValue: true
+      - key: ENCRYPTION_KEY
+        generateValue: true
+      - key: SCREEN_PROXY_SECRET
+        generateValue: true
+      - key: RAKAZO_STARTUP
+        value: |-
+          const { spawnSync, spawn } = require("child_process");
+          const m = spawnSync("pnpm", ["--filter","@rakazo/db","exec","prisma","migrate","deploy"], { stdio:"inherit", env:process.env });
+          if (m.status !== 0) { console.error("[boot] migrations FAILED"); process.exit(m.status || 1); }
+          console.log("[boot] migrations OK");
+          const port = process.env.PORT || "10000";
+          const c = spawn("pnpm", ["--filter","@rakazo/api","start"], { stdio:"inherit",
+            env: Object.assign({}, process.env, { API_HOST:"0.0.0.0", API_PORT:port, NODE_OPTIONS:"--max-old-space-size=384" }) });
+          console.log("[boot] api starting on 0.0.0.0:"+port);
+          c.on("exit",(code,sig)=>{ console.log("[boot] api exited "+code+"/"+sig); process.exit(code||1); });
+          process.on("SIGTERM",()=>{ try{c.kill("SIGTERM");}catch(e){} setTimeout(()=>process.exit(0),4000); });
+          setInterval(()=>{},60000);
+
   - type: web
     name: rakazo-web
     runtime: image
@@ -18,11 +85,8 @@ services:
     region: singapore
     image:
       url: ghcr.io/elie222/rakazo/app:edge
-    healthCheckPath: /
-    dockerCommand: >-
-      bash -lc 'pnpm --filter @rakazo/db exec prisma migrate deploy
-      && pnpm --filter @rakazo/api start & pnpm --filter @rakazo/worker start &
-      pnpm --filter @rakazo/web preview --host 0.0.0.0 --port "$PORT"'
+    healthCheckPath: /health
+    dockerCommand: node -e "eval(process.env.RAKAZO_STARTUP)"
     envVars:
       - key: NODE_ENV
         value: production
@@ -33,20 +97,127 @@ services:
       - key: REDIS_URL
         value: ""
       - key: API_PROXY_TARGET
-        value: http://127.0.0.1:3100
+        fromService:
+          type: web
+          name: rakazo-api
+          property: host
       - key: BETTER_AUTH_SECRET
         generateValue: true
       - key: ENCRYPTION_KEY
         generateValue: true
       - key: SCREEN_PROXY_SECRET
         generateValue: true
-      # Set these after the first deploy, once the public URL is known:
-      # - key: WEB_ORIGIN
-      #   value: https://<rakazo-web-public-url>
-      # - key: BETTER_AUTH_URL
-      #   value: https://<rakazo-web-public-url>/api
-      # - key: API_URL
-      #   value: https://<rakazo-web-public-url>/api
+      - key: RAKAZO_STARTUP
+        value: |-
+          const http = require("http");
+          const https = require("https");
+          const fs = require("fs");
+          const path = require("path");
+          const port = process.env.PORT || "10000";
+          const dist = "/app/apps/web/dist";
+          const apiTarget = process.env.API_PROXY_TARGET || "https://rakazo-api.onrender.com";
+
+          const mime = {
+            ".html": "text/html; charset=utf-8",
+            ".js": "text/javascript; charset=utf-8",
+            ".mjs": "text/javascript; charset=utf-8",
+            ".css": "text/css; charset=utf-8",
+            ".json": "application/json",
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".gif": "image/gif",
+            ".svg": "image/svg+xml",
+            ".ico": "image/x-icon",
+            ".webp": "image/webp",
+            ".woff": "font/woff",
+            ".woff2": "font/woff2",
+            ".ttf": "font/ttf",
+            ".map": "application/json",
+          };
+
+          function proxyApi(req, res) {
+            const target = new URL(apiTarget);
+            const headers = Object.assign({}, req.headers, { host: target.host });
+            delete headers["connection"];
+            const pr = https.request(
+              { hostname: target.hostname, port: target.port || 443, path: req.url, method: req.method, headers },
+              (pres) => { res.writeHead(pres.statusCode, pres.headers); pres.pipe(res); }
+            );
+            pr.on("error", () => { res.writeHead(502, {"content-type":"text/plain"}); res.end("api proxy error"); });
+            req.pipe(pr);
+          }
+
+          function serveStatic(req, res) {
+            let p = decodeURIComponent(req.url.split("?")[0]);
+            if (p === "/") p = "/index.html";
+            let file = path.normalize(path.join(dist, p));
+            if (!file.startsWith(dist)) { res.writeHead(403); res.end("forbidden"); return; }
+            fs.stat(file, (err, st) => {
+              if (err || !st.isFile()) file = path.join(dist, "index.html"); // SPA fallback
+              fs.readFile(file, (err2, data) => {
+                if (err2) { res.writeHead(200, {"content-type":"text/plain"}); res.end("rakazo web"); return; }
+                res.writeHead(200, {"content-type": mime[path.extname(file).toLowerCase()] || "application/octet-stream", "cache-control": "no-cache"});
+                res.end(data);
+              });
+            });
+          }
+
+          http.createServer((req, res) => {
+            if (req.url === "/health" || req.url === "/healthz") { res.writeHead(200); res.end("ok"); return; }
+            if (req.url.startsWith("/api/")) { proxyApi(req, res); return; }
+            serveStatic(req, res);
+          }).listen(port, "0.0.0.0", () => console.log("[boot] web static+proxy on 0.0.0.0:" + port));
+
+  - type: web
+    name: rakazo-worker
+    runtime: image
+    plan: free
+    region: singapore
+    image:
+      url: ghcr.io/elie222/rakazo/app:edge
+    healthCheckPath: /
+    dockerCommand: node -e "eval(process.env.WORKER_STARTUP)"
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: rakazo-db
+          property: connectionString
+      - key: REDIS_URL
+        value: ""
+      - key: WEB_ORIGIN
+        fromService:
+          type: web
+          name: rakazo-web
+          property: host
+      - key: BETTER_AUTH_URL
+        fromService:
+          type: web
+          name: rakazo-web
+          property: host
+      - key: API_URL
+        fromService:
+          type: web
+          name: rakazo-api
+          property: host
+      - key: BETTER_AUTH_SECRET
+        generateValue: true
+      - key: ENCRYPTION_KEY
+        generateValue: true
+      - key: SCREEN_PROXY_SECRET
+        generateValue: true
+      - key: WORKER_STARTUP
+        value: |-
+          const { spawn } = require("child_process");
+          const http = require("http");
+          const port = process.env.PORT || "10000";
+          http.createServer((req,res)=>{ res.writeHead(200,{"content-type":"text/plain"}); res.end("worker ok"); }).listen(port,"0.0.0.0",()=>console.log("[boot] health on 0.0.0.0:"+port));
+          console.log("[boot] worker starting");
+          const c = spawn("pnpm",["--filter","@rakazo/worker","start"],{stdio:"inherit",cwd:"/app"});
+          c.on("exit",(code,sig)=>{ console.log("[boot] worker exited "+code+"/"+sig); process.exit(code||1); });
+          c.on("error",(e)=>{ console.log("[boot] worker error "+e.message); process.exit(1); });
 
 databases:
   - name: rakazo-db
