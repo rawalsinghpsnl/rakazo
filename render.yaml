@@ -1,110 +1,52 @@
-# Rakazo on Render — Blueprint
-# Deploys the published GHCR images (no build needed):
-#   ghcr.io/elie222/rakazo/app:edge  (api + worker + web, different commands)
-# Local Docker "computers" are unavailable on Render (no Docker daemon):
-# the app boots with the sandbox provider as "none". Add E2B_API_KEY /
-# DAYTONA_API_KEY / BOX_API_KEY later to enable remote computers.
+# Rakazo on Render — FREE tier ($0) single-service deployment.
+#
+# Why one service: Render's free plan only allows web services (no private
+# services, no background workers). So migrations + API + worker + web UI all
+# run inside a single free web service from the prebuilt public image.
+# The web UI proxies /api to the API on localhost:3100 inside the container.
+#
+# Limits of this setup:
+# - Free web services sleep after ~15 min of inactivity (first request wakes).
+# - Free Postgres expires after 30 days (see expiresAt in dashboard).
+# - If one process (api/worker) crashes, the container keeps running.
 
-envVarGroups:
-  - name: rakazo-secrets
+services:
+  - type: web
+    name: rakazo-web
+    runtime: image
+    plan: free
+    region: singapore
+    image:
+      url: ghcr.io/elie222/rakazo/app:edge
+    healthCheckPath: /
+    dockerCommand: >-
+      bash -lc 'pnpm --filter @rakazo/db exec prisma migrate deploy
+      && pnpm --filter @rakazo/api start & pnpm --filter @rakazo/worker start &
+      pnpm --filter @rakazo/web preview --host 0.0.0.0 --port "$PORT"'
     envVars:
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        fromDatabase:
+          name: rakazo-db
+          property: connectionString
+      - key: REDIS_URL
+        value: ""
+      - key: API_PROXY_TARGET
+        value: http://127.0.0.1:3100
       - key: BETTER_AUTH_SECRET
         generateValue: true
       - key: ENCRYPTION_KEY
         generateValue: true
       - key: SCREEN_PROXY_SECRET
         generateValue: true
-
-services:
-  # Public web UI (Vite preview). Proxies /api + websockets to rakazo-api.
-  - type: web
-    name: rakazo-web
-    runtime: image
-    image:
-      url: ghcr.io/elie222/rakazo/app:edge
-    plan: free
-    region: singapore
-    dockerCommand: pnpm --filter @rakazo/web preview --host 0.0.0.0 --port 5173
-    healthCheckPath: /
-    envVarGroups:
-      - name: rakazo-secrets
-    envVars:
-      - key: NODE_ENV
-        value: production
-      - key: PORT
-        value: 5173
-      - key: API_PROXY_TARGET
-        fromService:
-          type: pserv
-          name: rakazo-api
-          property: hostport
-      - key: RAKAZO_HOST
-        fromService:
-          type: web
-          name: rakazo-web
-          property: host
-
-  # Backend API (Hono). Private — only reachable via the web proxy / private net.
-  - type: pserv
-    name: rakazo-api
-    runtime: image
-    image:
-      url: ghcr.io/elie222/rakazo/app:edge
-    plan: free
-    region: singapore
-    dockerCommand: bash -lc "pnpm --filter @rakazo/db exec prisma migrate deploy && pnpm --filter @rakazo/api start"
-    envVarGroups:
-      - name: rakazo-secrets
-    envVars:
-      - key: NODE_ENV
-        value: production
-      - key: API_HOST
-        value: 0.0.0.0
-      - key: API_PORT
-        value: 3100
-      - key: PORT
-        value: 3100
-      - key: DATA_DIR
-        value: /data
-      - key: DATABASE_URL
-        fromDatabase:
-          name: rakazo-db
-          property: connectionString
-      - key: SANDBOX_PROVIDER
-        value: docker
-      - key: AGENT_RUNTIME
-        value: pi
-      - key: WAKEUP_DRIVER
-        value: graphile
-      # BETTER_AUTH_URL / WEB_ORIGIN / API_URL are set to the real public web
-      # URL via the Render API after the first deploy (needs the live hostname).
-
-  # Background worker (Graphile). No HTTP server — background worker type.
-  - type: worker
-    name: rakazo-worker
-    runtime: image
-    image:
-      url: ghcr.io/elie222/rakazo/app:edge
-    plan: free
-    region: singapore
-    dockerCommand: pnpm --filter @rakazo/worker start
-    envVarGroups:
-      - name: rakazo-secrets
-    envVars:
-      - key: NODE_ENV
-        value: production
-      - key: DATA_DIR
-        value: /data
-      - key: DATABASE_URL
-        fromDatabase:
-          name: rakazo-db
-          property: connectionString
-      - key: SANDBOX_PROVIDER
-        value: docker
-      - key: AGENT_RUNTIME
-        value: pi
-      - key: WAKEUP_DRIVER
-        value: graphile
+      # Set these after the first deploy, once the public URL is known:
+      # - key: WEB_ORIGIN
+      #   value: https://<rakazo-web-public-url>
+      # - key: BETTER_AUTH_URL
+      #   value: https://<rakazo-web-public-url>/api
+      # - key: API_URL
+      #   value: https://<rakazo-web-public-url>/api
 
 databases:
   - name: rakazo-db
@@ -112,4 +54,4 @@ databases:
     region: singapore
     postgresMajorVersion: "16"
     databaseName: rakazo
-    user: rakazo
+    databaseUser: rakazo
